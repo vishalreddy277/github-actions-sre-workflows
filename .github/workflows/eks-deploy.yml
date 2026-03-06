@@ -1,0 +1,117 @@
+name: Deploy to EKS
+
+on:
+  workflow_call:
+    inputs:
+      cluster_name:
+        required: true
+        type: string
+      namespace:
+        required: true
+        type: string
+      deployment_name:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      aws_region:
+        required: false
+        type: string
+        default: us-east-1
+      container_name:
+        required: false
+        type: string
+        default: app
+      rollout_timeout:
+        required: false
+        type: string
+        default: "5m"
+    secrets:
+      aws_role_arn:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.namespace }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ inputs.aws_region }} \
+            --name ${{ inputs.cluster_name }}
+
+      - name: Get current image (for rollback reference)
+        id: current-image
+        run: |
+          CURRENT=$(kubectl get deployment ${{ inputs.deployment_name }} \
+            -n ${{ inputs.namespace }} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "image=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Current image: $CURRENT"
+
+      - name: Deploy new image
+        run: |
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ inputs.deployment_name }}:${{ inputs.image_tag }}"
+          echo "Deploying: $IMAGE"
+
+          kubectl set image deployment/${{ inputs.deployment_name }} \
+            ${{ inputs.container_name }}=$IMAGE \
+            -n ${{ inputs.namespace }}
+
+          kubectl annotate deployment/${{ inputs.deployment_name }} \
+            -n ${{ inputs.namespace }} \
+            kubernetes.io/change-cause="GitHub Actions deploy: ${{ github.sha }} by ${{ github.actor }}" \
+            --overwrite
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ inputs.deployment_name }} \
+            -n ${{ inputs.namespace }} \
+            --timeout=${{ inputs.rollout_timeout }}
+
+      - name: Verify pods are healthy
+        run: |
+          kubectl get pods -n ${{ inputs.namespace }} \
+            -l app=${{ inputs.deployment_name }} \
+            --field-selector=status.phase=Running
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deploy failed. Rolling back to previous version..."
+          kubectl rollout undo deployment/${{ inputs.deployment_name }} \
+            -n ${{ inputs.namespace }}
+          kubectl rollout status deployment/${{ inputs.deployment_name }} \
+            -n ${{ inputs.namespace }} \
+            --timeout=3m
+          echo "Rollback complete. Previous image: ${{ steps.current-image.outputs.image }}"
+
+      - name: Deploy summary
+        if: success()
+        run: |
+          echo "### Deploy successful :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | ${{ inputs.cluster_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ inputs.namespace }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment | ${{ inputs.deployment_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image tag | ${{ inputs.image_tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
